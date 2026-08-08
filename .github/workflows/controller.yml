@@ -379,6 +379,10 @@ jobs:
           func writeJSONFile(file string, value any) error { data, err := json.MarshalIndent(value, "", "  "); if err != nil { return err }; if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil { return err }; return os.WriteFile(file, append(data, '\n'), 0o644) }
           func uniqueInts(values []int) []int { result := []int{}; for _, value := range values { if !slices.Contains(result, value) { result = append(result, value) } }; return result }
           EOF
+          (
+            cd "$controller"
+            go mod download
+          )
 
       - name: Admit and update trusted registry state
         id: result
