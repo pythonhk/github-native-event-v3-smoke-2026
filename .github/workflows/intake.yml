@@ -16,6 +16,10 @@ permissions:
   contents: read
   pull-requests: read
 
+concurrency:
+  group: eventctl-v3-intake-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   intake:
     name: Read one request artifact
@@ -129,7 +133,7 @@ jobs:
             core.setOutput("artifact_name", `intake-${pull.number}-${pull.head.sha}`);
 
       - name: Upload the trusted intake record
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.intake.outputs.artifact_name }}
           path: |
