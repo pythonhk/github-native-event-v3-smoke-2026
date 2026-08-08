@@ -72,9 +72,17 @@ code. `controller.yml` is a `workflow_run` pipeline with admission, isolated
 scoring, and trusted result update jobs.
 
 The scorer has no repository write permission or organizer private keys. It
-emits an encrypted transport artifact for the trusted update job; raw logs are
-never uploaded. The update job signs and encrypts the final `feedback.tar` to
-every registered team encryption public key.
+receives an artifact containing only the admitted public-PR reference, fetches
+that exact immutable `submission.tar`, and mounts it read-only. The submission
+tar is never copied into an Actions artifact. The scorer emits an encrypted
+transport artifact for the trusted update job; raw logs are never uploaded.
+The update job signs and encrypts the final `feedback.tar` to every registered
+team encryption public key, then removes all internal pipeline artifacts.
+
+This generic scorer therefore assumes a public event repository and public
+participant forks. A private event needs its own trusted delivery/execution
+adapter; do not give this no-secret scorer a repository token just to fetch a
+private submission.
 
 The protected registry contains no request tars or logs:
 
