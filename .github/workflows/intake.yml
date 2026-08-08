@@ -8,6 +8,10 @@ on:
       - opened
       - reopened
       - synchronize
+    paths:
+      - formation.tar
+      - key.tar
+      - submission.tar
 
 # This workflow handles untrusted pull requests.  It intentionally has no
 # checkout step: the only bytes it reads are the one approved Git blob fetched
