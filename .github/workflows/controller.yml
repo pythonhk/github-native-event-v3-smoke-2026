@@ -1,0 +1,660 @@
+name: event / controller
+
+on:
+  workflow_run:
+    workflows: [event / intake]
+    types: [completed]
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: eventctl-v3-registry
+  cancel-in-progress: false
+
+env:
+  # Set this to the new repository's owner/name before accepting requests.
+  EVENTCTL_EVENT_ID: pythonhk/REPLACE_ME
+  EVENTCTL_MINIMUM_MEMBERS: "1"
+  EVENTCTL_ATTEMPT_LIMIT: "0"
+  EVENTCTL_SCORER_IMAGE: REPLACE_WITH_A_DIGEST_PINNED_IMAGE
+  EVENTCTL_SCORER_COMMAND: test -f /input/submission.tar
+
+jobs:
+  admission:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: write
+    outputs:
+      accepted: ${{ steps.result.outputs.accepted }}
+      kind: ${{ steps.result.outputs.kind }}
+      team_id: ${{ steps.result.outputs.team_id }}
+      admission_artifact_id: ${{ steps.publish-submission.outputs.artifact-id }}
+      controller_source_artifact_id: ${{ steps.upload-controller.outputs.artifact-id }}
+    steps:
+      - name: Set up the pinned Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v6.0.0
+        with:
+          go-version: "1.26.5"
+
+      - name: Download trusted intake artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v7.0.0
+        with:
+          pattern: intake-*
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/intake
+          merge-multiple: true
+
+      - name: Check out trusted registry state
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: registry
+          path: registry
+          persist-credentials: true
+
+      - name: Check out trusted default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          path: trusted-main
+          persist-credentials: false
+
+      - name: Materialize the pinned controller
+        run: |
+          controller="$RUNNER_TEMP/eventctl-v3-controller"
+          mkdir -p "$controller"
+          cat > "$controller/go.mod" <<'EOF'
+          module eventctl-v3-controller
+
+          go 1.26.0
+
+          require (
+            filippo.io/age v1.3.1
+            github.com/pythonhk/eventctl v0.3.0
+          )
+          EOF
+          cat > "$controller/main.go" <<'EOF'
+          package main
+
+          import (
+            "bytes"
+            "crypto/ed25519"
+            "encoding/json"
+            "errors"
+            "flag"
+            "io"
+            "os"
+            "path/filepath"
+            "slices"
+            "strconv"
+
+            "filippo.io/age"
+            "github.com/pythonhk/eventctl/protocol"
+          )
+
+          type intake struct {
+            PullRequest int    `json:"pr_number"`
+            ActorID     string `json:"opener_github_id"`
+            HeadSHA     string `json:"head_sha"`
+            HeadRepository string `json:"head_repository"`
+            BaseSHA     string `json:"base_sha"`
+            BlobRepository string `json:"blob_repository"`
+            BlobSHA     string `json:"blob_sha"`
+            TarSHA256   string `json:"tar_sha256"`
+            Name        string `json:"request_path"`
+          }
+
+          type provenance struct {
+            ActorID     string `json:"actor_id"`
+            PullRequest int    `json:"pull_request"`
+            HeadSHA     string `json:"head_sha"`
+            BlobSHA     string `json:"blob_sha"`
+            TarSHA256   string `json:"tar_sha256"`
+          }
+
+          type team struct {
+            ID      string   `json:"id"`
+            Name    string   `json:"name"`
+            Members []string `json:"members"`
+          }
+
+          type lane struct {
+            ActorID     string `json:"actor_id"`
+            LastHeadSHA string `json:"last_head_sha"`
+          }
+
+          type attempt struct {
+            ActorID   string `json:"actor_id"`
+            PR        int    `json:"pull_request"`
+            HeadSHA   string `json:"head_sha"`
+            TarSHA256 string `json:"tar_sha256"`
+            Status    string `json:"status"`
+            Score     int    `json:"score,omitempty"`
+          }
+
+          type state struct {
+            Status        string                `json:"status"`
+            Formation     provenance            `json:"formation"`
+            KeyProofs     map[string]provenance `json:"key_proofs"`
+            SubmissionPRs map[string]lane       `json:"submission_prs"`
+            Attempts      []attempt             `json:"attempts"`
+            ScoringStatus string                `json:"scoring_status"`
+          }
+
+          type admission struct {
+            Accepted bool   `json:"accepted"`
+            Reason   string `json:"reason,omitempty"`
+            Kind     string `json:"kind,omitempty"`
+            TeamID   string `json:"team_id,omitempty"`
+            Intake   intake `json:"intake"`
+            ClosePRs []int  `json:"close_prs,omitempty"`
+          }
+
+          type transport struct {
+            Score    int    `json:"score"`
+            Feedback string `json:"feedback"`
+          }
+
+          type leaderboard struct {
+            Teams map[string]leaderboardEntry `json:"teams"`
+          }
+
+          type leaderboardEntry struct {
+            Score int `json:"score"`
+          }
+
+          func main() {
+            if len(os.Args) < 2 {
+              panic("controller operation is required")
+            }
+            switch os.Args[1] {
+            case "admit":
+              admit(os.Args[2:])
+            case "seal-transport":
+              sealTransport(os.Args[2:])
+            case "result":
+              result(os.Args[2:])
+            default:
+              panic("unknown controller operation")
+            }
+          }
+
+          func admit(arguments []string) {
+            flags := flag.NewFlagSet("admit", flag.ExitOnError)
+            registry := flags.String("registry", "", "")
+            intakePath := flags.String("intake", "", "")
+            request := flags.String("request", "", "")
+            out := flags.String("out", "", "")
+            eventID := flags.String("event-id", "", "")
+            organizerSigning := flags.String("organizer-signing", "", "")
+            organizerEncryption := flags.String("organizer-encryption", "", "")
+            minimumMembers := flags.Int("minimum-members", 1, "")
+            attemptLimit := flags.Int("attempt-limit", 0, "")
+            flags.Parse(arguments)
+
+            value := readJSON[intake](*intakePath)
+            accepted := admitArtifact(*registry, *request, value, *eventID, *organizerSigning, *organizerEncryption, *minimumMembers, *attemptLimit)
+            writeJSON(*out, accepted)
+          }
+
+          func admitArtifact(registry, request string, value intake, eventID, organizerSigning, organizerEncryption string, minimumMembers, attemptLimit int) admission {
+            reject := func(reason string) admission { return admission{Reason: reason, Intake: value} }
+            if eventID == "pythonhk/REPLACE_ME" { return reject("event is not configured") }
+            if _, err := protocol.LoadSigningPublic(organizerSigning); err != nil { return reject("organizer signing public key is not bootstrapped") }
+            if _, err := protocol.LoadEncryptionPublic(organizerEncryption); err != nil { return reject("organizer encryption public key is not bootstrapped") }
+            artifact, err := protocol.ReadArtifact(request)
+            if err != nil { return reject(err.Error()) }
+            if artifact.SHA256 != value.TarSHA256 { return reject("request digest does not match intake") }
+            if err := protocol.VerifyArtifactSelf(artifact); err != nil { return reject(err.Error()) }
+            if artifact.Manifest.EventID != eventID { return reject("artifact event does not match this repository") }
+            if artifact.Manifest.GitHubID != value.ActorID { return reject("artifact actor does not match PR opener") }
+            expected := map[string]string{"team-formation": "formation.tar", "team-key": "key.tar", "submission": "submission.tar"}
+            if expected[artifact.Manifest.Kind] != value.Name { return reject("artifact kind does not match changed filename") }
+            source := provenance{ActorID: value.ActorID, PullRequest: value.PullRequest, HeadSHA: value.HeadSHA, BlobSHA: value.BlobSHA, TarSHA256: value.TarSHA256}
+            directory := filepath.Join(registry, "teams", artifact.Manifest.TeamID)
+
+            switch artifact.Manifest.Kind {
+            case "team-formation":
+              if minimumMembers < 1 || len(artifact.Manifest.Members) < minimumMembers { return reject("team does not meet the event minimum") }
+              if _, err := os.Stat(directory); !errors.Is(err, os.ErrNotExist) { return reject("team ID already exists") }
+              teamValue := team{ID: artifact.Manifest.TeamID, Name: artifact.Manifest.TeamName, Members: artifact.Manifest.Members}
+              status := "pending"
+              close := []int(nil)
+              if len(teamValue.Members) == 1 { status, close = "active", []int{value.PullRequest} }
+              stateValue := state{Status: status, Formation: source, KeyProofs: map[string]provenance{value.ActorID: source}, SubmissionPRs: map[string]lane{}, Attempts: []attempt{}, ScoringStatus: "idle"}
+              if err := writeTeam(directory, teamValue, stateValue, value.ActorID, artifact.Manifest.SigningPublicKey, artifact.Manifest.EncryptionPublicKey); err != nil { return reject(err.Error()) }
+              return admission{Accepted: true, Kind: artifact.Manifest.Kind, TeamID: teamValue.ID, Intake: value, ClosePRs: close}
+            case "team-key":
+              teamValue, stateValue, err := readTeam(directory)
+              if err != nil { return reject("unknown team") }
+              if stateValue.Status != "pending" || artifact.Manifest.FormationSHA256 != stateValue.Formation.TarSHA256 { return reject("key proof is not for a pending formation") }
+              if !slices.Contains(teamValue.Members, value.ActorID) || value.ActorID == stateValue.Formation.ActorID { return reject("key proof actor is invalid") }
+              if _, exists := stateValue.KeyProofs[value.ActorID]; exists { return reject("member key already accepted") }
+              stateValue.KeyProofs[value.ActorID] = source
+              if err := writeKeys(directory, value.ActorID, artifact.Manifest.SigningPublicKey, artifact.Manifest.EncryptionPublicKey); err != nil { return reject(err.Error()) }
+              close := []int(nil)
+              if len(stateValue.KeyProofs) == len(teamValue.Members) {
+                stateValue.Status = "active"
+                close = []int{stateValue.Formation.PullRequest}
+                for _, proof := range stateValue.KeyProofs { close = append(close, proof.PullRequest) }
+                close = uniqueInts(close)
+              }
+              if err := writeJSONFile(filepath.Join(directory, "state.json"), stateValue); err != nil { return reject(err.Error()) }
+              return admission{Accepted: true, Kind: artifact.Manifest.Kind, TeamID: teamValue.ID, Intake: value, ClosePRs: close}
+            case "submission":
+              teamValue, stateValue, err := readTeam(directory)
+              if err != nil { return reject("unknown team") }
+              if stateValue.Status != "active" { return reject("team is not active") }
+              if !slices.Contains(teamValue.Members, value.ActorID) { return reject("submission actor is not a team member") }
+              trusted, err := protocol.LoadSigningPublic(filepath.Join(directory, value.ActorID+".sig.pub"))
+              if err != nil { return reject("registered signing key is unavailable") }
+              if err := protocol.VerifyArtifact(artifact, trusted); err != nil { return reject(err.Error()) }
+              key := strconv.Itoa(value.PullRequest)
+              existing, exists := stateValue.SubmissionPRs[key]
+              if exists && existing.ActorID != value.ActorID { return reject("submission PR belongs to a different actor") }
+              if exists && existing.LastHeadSHA == value.HeadSHA { return reject("submission head was already admitted") }
+              if attemptLimit > 0 && len(stateValue.Attempts) >= attemptLimit { return reject("team attempt quota exhausted") }
+              for _, prior := range stateValue.Attempts {
+                if prior.HeadSHA == value.HeadSHA || prior.TarSHA256 == value.TarSHA256 { return reject("submission was replayed") }
+              }
+              stateValue.SubmissionPRs[key] = lane{ActorID: value.ActorID, LastHeadSHA: value.HeadSHA}
+              stateValue.Attempts = append(stateValue.Attempts, attempt{ActorID: value.ActorID, PR: value.PullRequest, HeadSHA: value.HeadSHA, TarSHA256: value.TarSHA256, Status: "admitted"})
+              stateValue.ScoringStatus = "pending"
+              if err := writeJSONFile(filepath.Join(directory, "state.json"), stateValue); err != nil { return reject(err.Error()) }
+              return admission{Accepted: true, Kind: artifact.Manifest.Kind, TeamID: teamValue.ID, Intake: value}
+            default:
+              return reject("unsupported artifact kind")
+            }
+          }
+
+          func sealTransport(arguments []string) {
+            flags := flag.NewFlagSet("seal-transport", flag.ExitOnError)
+            recipientPath := flags.String("recipient", "", "")
+            input := flags.String("input", "", "")
+            output := flags.String("out", "", "")
+            flags.Parse(arguments)
+            recipient, err := protocol.LoadEncryptionPublic(*recipientPath)
+            if err != nil { panic(err) }
+            data, err := os.ReadFile(*input)
+            if err != nil { panic(err) }
+            file, err := os.Create(*output)
+            if err != nil { panic(err) }
+            writer, err := age.Encrypt(file, recipient.Recipient)
+            if err != nil { panic(err) }
+            if _, err := writer.Write(data); err != nil { panic(err) }
+            if err := writer.Close(); err != nil { panic(err) }
+            if err := file.Close(); err != nil { panic(err) }
+          }
+
+          func result(arguments []string) {
+            flags := flag.NewFlagSet("result", flag.ExitOnError)
+            registry := flags.String("registry", "", "")
+            board := flags.String("leaderboard", "", "")
+            admissionPath := flags.String("admission", "", "")
+            transportPath := flags.String("transport", "", "")
+            organizerSigning := flags.String("organizer-signing", "", "")
+            organizerEncryption := flags.String("organizer-encryption", "", "")
+            organizerSigningPublic := flags.String("organizer-signing-public", "", "")
+            organizerEncryptionPublic := flags.String("organizer-encryption-public", "", "")
+            feedback := flags.String("feedback", "", "")
+            flags.Parse(arguments)
+            accepted := readJSON[admission](*admissionPath)
+            identity, err := protocol.LoadEncryptionPrivate(*organizerEncryption)
+            if err != nil { panic(err) }
+            expectedEncryption, err := protocol.LoadEncryptionPublic(*organizerEncryptionPublic)
+            if err != nil { panic(err) }
+            if identity.Recipient().String() != expectedEncryption.Text { panic("organizer encryption private key does not match its public key") }
+            encrypted, err := os.ReadFile(*transportPath)
+            if err != nil { panic(err) }
+            reader, err := age.Decrypt(bytes.NewReader(encrypted), identity)
+            if err != nil { panic(err) }
+            payload, err := io.ReadAll(reader)
+            if err != nil { panic(err) }
+            scored := decode[transport](payload)
+            directory := filepath.Join(*registry, "teams", accepted.TeamID)
+            teamValue, stateValue, err := readTeam(directory)
+            if err != nil { panic(err) }
+            matched := false
+            for index := range stateValue.Attempts {
+              current := &stateValue.Attempts[index]
+              if current.PR != accepted.Intake.PullRequest || current.HeadSHA != accepted.Intake.HeadSHA { continue }
+              switch current.Status {
+              case "admitted":
+                current.Status, current.Score, matched = "scored", scored.Score, true
+              case "scored":
+                if current.Score != scored.Score { panic("retry scorer result disagrees with recorded score") }
+                matched = true
+              default:
+                panic("matching attempt is not scoreable")
+              }
+            }
+            if !matched { panic("admitted attempt is missing") }
+            stateValue.ScoringStatus = "complete"
+            if err := writeJSONFile(filepath.Join(directory, "state.json"), stateValue); err != nil { panic(err) }
+            boardValue := leaderboard{Teams: map[string]leaderboardEntry{}}
+            if _, err := os.Stat(*board); err == nil { boardValue = readJSON[leaderboard](*board) }
+            if boardValue.Teams == nil { boardValue.Teams = map[string]leaderboardEntry{} }
+            boardValue.Teams[teamValue.ID] = leaderboardEntry{Score: scored.Score}
+            if err := writeJSONFile(*board, boardValue); err != nil { panic(err) }
+            signing, err := protocol.LoadSigningPrivate(*organizerSigning)
+            if err != nil { panic(err) }
+            expectedSigning, err := protocol.LoadSigningPublic(*organizerSigningPublic)
+            if err != nil { panic(err) }
+            if !bytes.Equal(signing.Public().(ed25519.PublicKey), expectedSigning) { panic("organizer signing private key does not match its public key") }
+            log := filepath.Join(filepath.Dir(*feedback), "feedback.json")
+            if err := writeJSONFile(log, map[string]any{"team_id": teamValue.ID, "score": scored.Score, "feedback": scored.Feedback}); err != nil { panic(err) }
+            recipients := make([]age.Recipient, 0, len(teamValue.Members))
+            for _, member := range teamValue.Members {
+              public, err := protocol.LoadEncryptionPublic(filepath.Join(directory, member+".enc.pub"))
+              if err != nil { panic(err) }
+              recipients = append(recipients, public.Recipient)
+            }
+            if _, err := protocol.SealFeedback([]string{log}, *feedback, signing, recipients); err != nil { panic(err) }
+          }
+
+          func readTeam(directory string) (team, state, error) {
+            if _, err := os.Stat(directory); err != nil { return team{}, state{}, err }
+            return readJSON[team](filepath.Join(directory, "team.json")), readJSON[state](filepath.Join(directory, "state.json")), nil
+          }
+
+          func writeTeam(directory string, teamValue team, stateValue state, actor, signing, encryption string) error {
+            if err := os.MkdirAll(directory, 0o755); err != nil { return err }
+            if err := writeJSONFile(filepath.Join(directory, "team.json"), teamValue); err != nil { return err }
+            if err := writeJSONFile(filepath.Join(directory, "state.json"), stateValue); err != nil { return err }
+            return writeKeys(directory, actor, signing, encryption)
+          }
+
+          func writeKeys(directory, actor, signing, encryption string) error {
+            if err := os.WriteFile(filepath.Join(directory, actor+".sig.pub"), []byte(signing), 0o644); err != nil { return err }
+            return os.WriteFile(filepath.Join(directory, actor+".enc.pub"), []byte(encryption+"\n"), 0o644)
+          }
+
+          func readJSON[T any](file string) T { data, err := os.ReadFile(file); if err != nil { panic(err) }; return decode[T](data) }
+          func decode[T any](data []byte) T { var value T; if err := json.Unmarshal(data, &value); err != nil { panic(err) }; return value }
+          func writeJSON(file string, value any) { if err := writeJSONFile(file, value); err != nil { panic(err) } }
+          func writeJSONFile(file string, value any) error { data, err := json.MarshalIndent(value, "", "  "); if err != nil { return err }; if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil { return err }; return os.WriteFile(file, append(data, '\n'), 0o644) }
+          func uniqueInts(values []int) []int { result := []int{}; for _, value := range values { if !slices.Contains(result, value) { result = append(result, value) } }; return result }
+          EOF
+
+      - name: Admit and update trusted registry state
+        id: result
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          controller="$RUNNER_TEMP/eventctl-v3-controller"
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$(jq -r .pr_number "$RUNNER_TEMP/intake/intake.json")" > "$RUNNER_TEMP/current-pr.json"
+          if jq -e \
+            --arg head "$(jq -r .head_sha "$RUNNER_TEMP/intake/intake.json")" \
+            --arg repository "$(jq -r .head_repository "$RUNNER_TEMP/intake/intake.json")" \
+            '.state == "open" and .base.ref == "main" and .head.sha == $head and .head.repo.full_name == $repository' \
+            "$RUNNER_TEMP/current-pr.json" > /dev/null; then
+            test "$(jq -r .blob_repository "$RUNNER_TEMP/intake/intake.json")" = "$GITHUB_REPOSITORY"
+            gh api "repos/$GITHUB_REPOSITORY/git/blobs/$(jq -r .blob_sha "$RUNNER_TEMP/intake/intake.json")" > "$RUNNER_TEMP/request-blob.json"
+            jq -r .content "$RUNNER_TEMP/request-blob.json" | tr -d '\n' | base64 --decode > "$RUNNER_TEMP/intake/request.tar"
+            test "$(sha256sum "$RUNNER_TEMP/intake/request.tar" | awk '{print $1}')" = "$(jq -r .tar_sha256 "$RUNNER_TEMP/intake/intake.json")"
+            (
+              cd "$controller"
+              go run . admit \
+                --registry "$GITHUB_WORKSPACE/registry" \
+                --intake "$RUNNER_TEMP/intake/intake.json" \
+                --request "$RUNNER_TEMP/intake/request.tar" \
+              --out "$RUNNER_TEMP/admission.json" \
+              --event-id "$EVENTCTL_EVENT_ID" \
+              --organizer-signing "$GITHUB_WORKSPACE/trusted-main/organizer.sig.pub" \
+              --organizer-encryption "$GITHUB_WORKSPACE/trusted-main/organizer.enc.pub" \
+                --minimum-members "$EVENTCTL_MINIMUM_MEMBERS" \
+                --attempt-limit "$EVENTCTL_ATTEMPT_LIMIT"
+            )
+          else
+            jq '{accepted: false, reason: "PR no longer has the admitted open head", intake: .}' \
+              "$RUNNER_TEMP/intake/intake.json" > "$RUNNER_TEMP/admission.json"
+          fi
+          jq -r '"accepted=\(.accepted)\nkind=\(.kind)\nteam_id=\(.team_id)"' "$RUNNER_TEMP/admission.json" >> "$GITHUB_OUTPUT"
+          if test "$(jq -r .accepted "$RUNNER_TEMP/admission.json")" = true; then
+            git -C registry config user.name eventctl-controller
+            git -C registry config user.email eventctl-controller@users.noreply.github.com
+            git -C registry add teams
+            git -C registry commit -m "event: admit $(jq -r .kind "$RUNNER_TEMP/admission.json")"
+            git -C registry push origin HEAD:registry
+          fi
+
+      - name: Close activated onboarding pull requests
+        if: steps.result.outputs.accepted == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          jq -r '.close_prs[]?' "$RUNNER_TEMP/admission.json" | while read -r number; do
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/pulls/$number" -f state=closed
+          done
+
+      - name: Publish the pinned controller source for later trusted jobs
+        id: publish-controller
+        if: steps.result.outputs.accepted == 'true' && steps.result.outputs.kind == 'submission'
+        run: |
+          source="$RUNNER_TEMP/eventctl-v3-controller-source"
+          mkdir -p "$source"
+          cp "$RUNNER_TEMP/eventctl-v3-controller/go.mod" "$source/go.mod"
+          cp "$RUNNER_TEMP/eventctl-v3-controller/main.go" "$source/main.go"
+          cp trusted-main/organizer.sig.pub "$source/organizer.sig.pub"
+          cp trusted-main/organizer.enc.pub "$source/organizer.enc.pub"
+
+      - name: Upload the pinned controller source for later trusted jobs
+        id: upload-controller
+        if: steps.result.outputs.accepted == 'true' && steps.result.outputs.kind == 'submission'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: eventctl-controller-source
+          path: ${{ runner.temp }}/eventctl-v3-controller-source
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Assemble the admitted-submission reference
+        if: steps.result.outputs.accepted == 'true' && steps.result.outputs.kind == 'submission'
+        run: |
+          handoff="$RUNNER_TEMP/eventctl-admission"
+          mkdir -p "$handoff"
+          cp "$RUNNER_TEMP/admission.json" "$handoff/admission.json"
+
+      - name: Publish the admitted-submission reference
+        id: publish-submission
+        if: steps.result.outputs.accepted == 'true' && steps.result.outputs.kind == 'submission'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: eventctl-admission
+          path: ${{ runner.temp }}/eventctl-admission
+          if-no-files-found: error
+          retention-days: 1
+
+  scorer:
+    needs: admission
+    if: needs.admission.outputs.accepted == 'true' && needs.admission.outputs.kind == 'submission'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      transport_artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Set up the pinned Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v6.0.0
+        with:
+          go-version: "1.26.5"
+
+      - name: Download the admitted-submission reference
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v7.0.0
+        with:
+          name: eventctl-admission
+          path: ${{ runner.temp }}/admission
+
+      - name: Download the pinned controller source
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v7.0.0
+        with:
+          name: eventctl-controller-source
+          path: ${{ runner.temp }}/eventctl-v3-controller
+
+      - name: Materialize the exact public submission blob
+        run: |
+          source_repository="$(jq -r .intake.head_repository "$RUNNER_TEMP/admission/admission.json")"
+          source_head="$(jq -r .intake.head_sha "$RUNNER_TEMP/admission/admission.json")"
+          expected_sha256="$(jq -r .intake.tar_sha256 "$RUNNER_TEMP/admission/admission.json")"
+          source_base="${EVENTCTL_PUBLIC_RAW_URL:-$GITHUB_SERVER_URL}"
+          [[ "$source_repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          [[ "$source_head" =~ ^[0-9a-f]{40}$ ]]
+          mkdir -p "$RUNNER_TEMP/admitted"
+          curl --fail --location --silent --show-error \
+            "$source_base/$source_repository/raw/$source_head/submission.tar" \
+            --output "$RUNNER_TEMP/admitted/submission.tar"
+          test "$(sha256sum "$RUNNER_TEMP/admitted/submission.tar" | awk '{print $1}')" = "$expected_sha256"
+
+      - name: Run the pinned event scorer without credentials
+        id: score
+        run: |
+          test "$EVENTCTL_SCORER_IMAGE" != REPLACE_WITH_A_DIGEST_PINNED_IMAGE
+          [[ "$EVENTCTL_SCORER_IMAGE" =~ ^[^[:space:]]+@sha256:[[:xdigit:]]{64}$ ]]
+          mkdir -p "$RUNNER_TEMP/scorer-output"
+          set +e
+          ulimit -f 2048
+          timeout --kill-after=5s 120s docker run --rm --network none --read-only \
+            --cap-drop ALL --security-opt no-new-privileges:true \
+            --pids-limit 128 --memory 512m --cpus 1 --user 65532:65532 \
+            --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+            --mount "type=bind,src=$RUNNER_TEMP/admitted,dst=/input,readonly" \
+            "$EVENTCTL_SCORER_IMAGE" sh -ceu "$EVENTCTL_SCORER_COMMAND" \
+            > "$RUNNER_TEMP/scorer-output/log.txt" 2>&1
+          code=$?
+          set -e
+          jq -n --argjson score "$code" --rawfile feedback "$RUNNER_TEMP/scorer-output/log.txt" \
+            '{score: (if $score == 0 then 1 else 0 end), feedback: $feedback}' > "$RUNNER_TEMP/scorer-output/result.json"
+
+      - name: Encrypt scorer transport to the organizer
+        run: |
+          controller="$RUNNER_TEMP/eventctl-v3-controller"
+          (
+            cd "$controller"
+            go run . seal-transport \
+              --recipient "$controller/organizer.enc.pub" \
+              --input "$RUNNER_TEMP/scorer-output/result.json" \
+              --out "$RUNNER_TEMP/scorer-output/transport.age"
+          )
+
+      - name: Upload encrypted scorer transport only
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: eventctl-scorer-transport
+          path: ${{ runner.temp }}/scorer-output/transport.age
+          if-no-files-found: error
+          retention-days: 1
+
+  result-update:
+    needs: [admission, scorer]
+    if: needs.admission.outputs.accepted == 'true' && needs.admission.outputs.kind == 'submission'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+      contents: write
+    steps:
+      - name: Set up the pinned Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v6.0.0
+        with:
+          go-version: "1.26.5"
+
+      - name: Download the admitted-submission reference
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v7.0.0
+        with:
+          name: eventctl-admission
+          path: ${{ runner.temp }}/admission
+
+      - name: Download encrypted scorer transport
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v7.0.0
+        with:
+          name: eventctl-scorer-transport
+          path: ${{ runner.temp }}/transport
+
+      - name: Download the pinned controller source
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v7.0.0
+        with:
+          name: eventctl-controller-source
+          path: ${{ runner.temp }}/eventctl-v3-controller
+
+      - name: Check out protected state branches
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: registry
+          path: registry
+          persist-credentials: true
+
+      - name: Check out derived leaderboard branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: leaderboard
+          path: leaderboard
+          persist-credentials: true
+
+      - name: Materialize organizer private keys
+        env:
+          ORGANIZER_SIGNING: ${{ secrets.EVENTCTL_ORGANIZER_SIG_PRIVATE }}
+          ORGANIZER_ENCRYPTION: ${{ secrets.EVENTCTL_ORGANIZER_ENC_PRIVATE }}
+        run: |
+          test -n "$ORGANIZER_SIGNING"
+          test -n "$ORGANIZER_ENCRYPTION"
+          printf '%s\n' "$ORGANIZER_SIGNING" > "$RUNNER_TEMP/organizer.sig.key"
+          printf '%s\n' "$ORGANIZER_ENCRYPTION" > "$RUNNER_TEMP/organizer.enc.key"
+          chmod 600 "$RUNNER_TEMP/organizer.sig.key" "$RUNNER_TEMP/organizer.enc.key"
+
+      - name: Update state and create encrypted team feedback
+        run: |
+          controller="$RUNNER_TEMP/eventctl-v3-controller"
+          (
+            cd "$controller"
+            go run . result \
+              --registry "$GITHUB_WORKSPACE/registry" \
+              --leaderboard "$GITHUB_WORKSPACE/leaderboard/leaderboard.json" \
+              --admission "$RUNNER_TEMP/admission/admission.json" \
+              --transport "$RUNNER_TEMP/transport/transport.age" \
+              --organizer-signing "$RUNNER_TEMP/organizer.sig.key" \
+              --organizer-encryption "$RUNNER_TEMP/organizer.enc.key" \
+              --organizer-signing-public "$controller/organizer.sig.pub" \
+              --organizer-encryption-public "$controller/organizer.enc.pub" \
+              --feedback "$RUNNER_TEMP/feedback.tar"
+          )
+
+      - name: Publish registry and leaderboard atomically
+        run: |
+          if git -C registry diff --quiet && git -C leaderboard diff --quiet; then
+            exit 0
+          fi
+          git -C registry config user.name eventctl-controller
+          git -C registry config user.email eventctl-controller@users.noreply.github.com
+          git -C leaderboard config user.name eventctl-controller
+          git -C leaderboard config user.email eventctl-controller@users.noreply.github.com
+          git -C registry add teams
+          git -C registry commit -m 'event: score submission'
+          git -C leaderboard add leaderboard.json
+          git -C leaderboard commit -m 'event: update leaderboard'
+          git -C registry fetch "$GITHUB_WORKSPACE/leaderboard" HEAD:refs/heads/eventctl-leaderboard
+          board=$(git -C leaderboard rev-parse HEAD)
+          git -C registry push --atomic origin HEAD:registry "$board":leaderboard
+
+      - name: Upload encrypted feedback only
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: feedback
+          path: ${{ runner.temp }}/feedback.tar
+          if-no-files-found: error
+
+      - name: Delete short-lived internal pipeline artifacts
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          for artifact in \
+            "${{ needs.admission.outputs.admission_artifact_id }}" \
+            "${{ needs.admission.outputs.controller_source_artifact_id }}" \
+            "${{ needs.scorer.outputs.transport_artifact_id }}"; do
+            if gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact" > /dev/null 2>&1; then
+              gh api --method DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact"
+            fi
+          done

@@ -1,0 +1,138 @@
+name: event / intake
+
+on:
+  pull_request_target:
+    branches:
+      - main
+    types:
+      - opened
+      - reopened
+      - synchronize
+
+# This workflow handles untrusted pull requests.  It intentionally has no
+# checkout step: the only bytes it reads are the one approved Git blob fetched
+# through the GitHub API below.
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  intake:
+    name: Read one request artifact
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch the exact submitted blob
+        id: intake
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const crypto = require("node:crypto");
+            const fs = require("node:fs");
+            const path = require("node:path");
+
+            const { owner, repo } = context.repo;
+            const pullNumber = context.payload.pull_request.number;
+            const { data: pull } = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: pullNumber,
+            });
+            const headRepository = pull.head.repo?.full_name;
+            if (typeof headRepository !== "string") {
+              core.setFailed("the pull request head repository is unavailable");
+              return;
+            }
+
+            if (pull.base.ref !== "main") {
+              core.setFailed("participant requests must target main");
+              return;
+            }
+            if (pull.changed_files !== 1) {
+              core.setFailed("a request PR must change exactly one root-level tar");
+              return;
+            }
+
+            const { data: files } = await github.rest.pulls.listFiles({
+              owner,
+              repo,
+              pull_number: pullNumber,
+              per_page: 100,
+            });
+            const { data: confirmedPull } = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: pullNumber,
+            });
+            if (
+              confirmedPull.head.sha !== pull.head.sha ||
+              confirmedPull.base.sha !== pull.base.sha ||
+              confirmedPull.head.repo?.full_name !== headRepository ||
+              confirmedPull.changed_files !== pull.changed_files
+            ) {
+              core.setFailed("the pull request changed while its request was being read; retry on its current head");
+              return;
+            }
+            const [file] = files;
+            const requestKinds = new Map([
+              ["formation.tar", "formation"],
+              ["key.tar", "key"],
+              ["submission.tar", "submission"],
+            ]);
+            const requestKind = file && requestKinds.get(file.filename);
+            if (
+              files.length !== 1 ||
+              !requestKind ||
+              (file.status !== "added" && file.status !== "modified") ||
+              typeof file.sha !== "string"
+            ) {
+              core.setFailed(
+                "the request must be an added or modified formation.tar, key.tar, or submission.tar at the repository root",
+              );
+              return;
+            }
+
+            const { data: blob } = await github.rest.git.getBlob({
+              owner,
+              repo,
+              file_sha: file.sha,
+            });
+            if (blob.encoding !== "base64") {
+              core.setFailed("GitHub returned a request blob with an unsupported encoding");
+              return;
+            }
+            if (blob.size > 64 * 1024 * 1024) {
+              core.setFailed("request artifacts must not exceed 64 MiB");
+              return;
+            }
+            const request = Buffer.from(blob.content.replace(/\s/g, ""), "base64");
+            const outputDirectory = path.join(process.env.RUNNER_TEMP, "eventctl-intake");
+            fs.mkdirSync(outputDirectory, { recursive: true });
+
+            const intake = {
+              schema: "github-native-event-starter/v3/intake",
+              pr_number: pull.number,
+              opener_github_id: String(pull.user.id),
+              head_sha: pull.head.sha,
+              head_repository: headRepository,
+              base_sha: pull.base.sha,
+              blob_repository: `${owner}/${repo}`,
+              blob_sha: file.sha,
+              tar_sha256: crypto.createHash("sha256").update(request).digest("hex"),
+              request_kind: requestKind,
+              request_path: file.filename,
+            };
+            fs.writeFileSync(
+              path.join(outputDirectory, "intake.json"),
+              `${JSON.stringify(intake, null, 2)}\n`,
+              { mode: 0o600 },
+            );
+            core.setOutput("artifact_name", `intake-${pull.number}-${pull.head.sha}`);
+
+      - name: Upload the trusted intake record
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.intake.outputs.artifact_name }}
+          path: |
+            ${{ runner.temp }}/eventctl-intake/intake.json
+          if-no-files-found: error
+          retention-days: 1
