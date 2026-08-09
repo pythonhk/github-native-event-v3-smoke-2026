@@ -10,8 +10,9 @@ registry     protected team state
 leaderboard  derived public results
 ```
 
-`main` begins with only this README and the two workflows. Add the challenge,
-criteria, and participant documentation after creating an event repository.
+`main` begins with only this README, `.gitignore`, and the two workflows. Add
+the challenge, criteria, and participant documentation after creating an event
+repository.
 
 ## Bootstrap an event
 
@@ -52,7 +53,7 @@ key.tar             one additional multi-member key proof
 submission.tar      a persistent member-owned submission lane
 ```
 
-Create these artifacts with the released `eventctl v0.3.0` CLI. The numeric
+Create these artifacts with the released `eventctl v0.3.1` CLI. The numeric
 `--github-id` must be the GitHub account ID that opens the PR.
 
 A `formation.tar` for one member activates that team automatically. A
@@ -71,18 +72,17 @@ and downloads the exact changed Git blob. It never checks out or runs fork
 code. `controller.yml` is a `workflow_run` pipeline with admission, isolated
 scoring, and trusted result update jobs.
 
-The scorer has no repository write permission or organizer private keys. It
-receives an artifact containing only the admitted public-PR reference, fetches
-that exact immutable `submission.tar`, and mounts it read-only. The submission
-tar is never copied into an Actions artifact. The scorer emits an encrypted
-transport artifact for the trusted update job; raw logs are never uploaded.
-The update job signs and encrypts the final `feedback.tar` to every registered
-team encryption public key, then removes all internal pipeline artifacts.
+The scorer has no repository write permission or organizer private keys. Before
+an admitted submission is committed to `registry`, the trusted admission job
+copies the already verified public `submission.tar` into an immutable handoff
+artifact. The scorer consumes that handoff and mounts the tar read-only. It
+emits an encrypted transport artifact for the trusted update job; raw logs are
+never uploaded. The update job signs and encrypts the final `feedback.tar` to
+every registered team encryption public key, then removes all internal pipeline
+artifacts.
 
-This generic scorer therefore assumes a public event repository and public
-participant forks. A private event needs its own trusted delivery/execution
-adapter; do not give this no-secret scorer a repository token just to fetch a
-private submission.
+Repository access stays in the trusted admission job. Do not give the scorer a
+repository token; the immutable handoff is its only input channel.
 
 The protected registry contains no request tars or logs:
 

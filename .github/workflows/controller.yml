@@ -10,6 +10,7 @@ permissions: {}
 
 concurrency:
   group: eventctl-v3-registry
+  queue: max
   cancel-in-progress: false
 
 env:
@@ -29,9 +30,9 @@ jobs:
       contents: write
       pull-requests: write
     outputs:
-      accepted: ${{ steps.result.outputs.accepted }}
-      kind: ${{ steps.result.outputs.kind }}
-      team_id: ${{ steps.result.outputs.team_id }}
+      accepted: ${{ steps.finalize.outputs.accepted }}
+      kind: ${{ steps.finalize.outputs.kind }}
+      team_id: ${{ steps.finalize.outputs.team_id }}
       admission_artifact_id: ${{ steps.publish-submission.outputs.artifact-id }}
       controller_source_artifact_id: ${{ steps.upload-controller.outputs.artifact-id }}
     steps:
@@ -74,7 +75,7 @@ jobs:
 
           require (
             filippo.io/age v1.3.1
-            github.com/pythonhk/eventctl v0.3.0
+            github.com/pythonhk/eventctl v0.3.1
           )
           EOF
           cat > "$controller/main.go" <<'EOF'
@@ -133,7 +134,7 @@ jobs:
             HeadSHA   string `json:"head_sha"`
             TarSHA256 string `json:"tar_sha256"`
             Status    string `json:"status"`
-            Score     int    `json:"score,omitempty"`
+            Score     int    `json:"score"`
           }
 
           type state struct {
@@ -220,7 +221,13 @@ jobs:
             switch artifact.Manifest.Kind {
             case "team-formation":
               if minimumMembers < 1 || len(artifact.Manifest.Members) < minimumMembers { return reject("team does not meet the event minimum") }
-              if _, err := os.Stat(directory); !errors.Is(err, os.ErrNotExist) { return reject("team ID already exists") }
+              if _, err := os.Stat(directory); err == nil {
+                teamValue, stateValue, err := readTeam(directory)
+                if err != nil { return reject("team ID already exists") }
+                proof, exists := stateValue.KeyProofs[value.ActorID]
+                if teamValue.ID != artifact.Manifest.TeamID || teamValue.Name != artifact.Manifest.TeamName || !slices.Equal(teamValue.Members, artifact.Manifest.Members) || stateValue.Formation != source || !exists || proof != source { return reject("team ID already exists") }
+                return admission{Accepted: true, Kind: artifact.Manifest.Kind, TeamID: teamValue.ID, Intake: value, ClosePRs: onboardingClosures(stateValue, len(teamValue.Members), value.PullRequest)}
+              } else if !errors.Is(err, os.ErrNotExist) { return reject(err.Error()) }
               teamValue := team{ID: artifact.Manifest.TeamID, Name: artifact.Manifest.TeamName, Members: artifact.Manifest.Members}
               status := "pending"
               close := []int(nil)
@@ -231,17 +238,19 @@ jobs:
             case "team-key":
               teamValue, stateValue, err := readTeam(directory)
               if err != nil { return reject("unknown team") }
-              if stateValue.Status != "pending" || artifact.Manifest.FormationSHA256 != stateValue.Formation.TarSHA256 { return reject("key proof is not for a pending formation") }
+              if artifact.Manifest.FormationSHA256 != stateValue.Formation.TarSHA256 { return reject("key proof is not for the registered formation") }
               if !slices.Contains(teamValue.Members, value.ActorID) || value.ActorID == stateValue.Formation.ActorID { return reject("key proof actor is invalid") }
-              if _, exists := stateValue.KeyProofs[value.ActorID]; exists { return reject("member key already accepted") }
+              if proof, exists := stateValue.KeyProofs[value.ActorID]; exists {
+                if proof != source { return reject("member key already accepted") }
+                return admission{Accepted: true, Kind: artifact.Manifest.Kind, TeamID: teamValue.ID, Intake: value, ClosePRs: onboardingClosures(stateValue, len(teamValue.Members), value.PullRequest)}
+              }
+              if stateValue.Status != "pending" { return reject("key proof is not for a pending formation") }
               stateValue.KeyProofs[value.ActorID] = source
               if err := writeKeys(directory, value.ActorID, artifact.Manifest.SigningPublicKey, artifact.Manifest.EncryptionPublicKey); err != nil { return reject(err.Error()) }
               close := []int(nil)
               if len(stateValue.KeyProofs) == len(teamValue.Members) {
                 stateValue.Status = "active"
-                close = []int{stateValue.Formation.PullRequest}
-                for _, proof := range stateValue.KeyProofs { close = append(close, proof.PullRequest) }
-                close = uniqueInts(close)
+                close = onboardingClosures(stateValue, len(teamValue.Members), value.PullRequest)
               }
               if err := writeJSONFile(filepath.Join(directory, "state.json"), stateValue); err != nil { return reject(err.Error()) }
               return admission{Accepted: true, Kind: artifact.Manifest.Kind, TeamID: teamValue.ID, Intake: value, ClosePRs: close}
@@ -256,7 +265,14 @@ jobs:
               key := strconv.Itoa(value.PullRequest)
               existing, exists := stateValue.SubmissionPRs[key]
               if exists && existing.ActorID != value.ActorID { return reject("submission PR belongs to a different actor") }
-              if exists && existing.LastHeadSHA == value.HeadSHA { return reject("submission head was already admitted") }
+              if exists && existing.LastHeadSHA == value.HeadSHA {
+                for _, prior := range stateValue.Attempts {
+                  if prior.ActorID == value.ActorID && prior.PR == value.PullRequest && prior.HeadSHA == value.HeadSHA && prior.TarSHA256 == value.TarSHA256 && (prior.Status == "admitted" || prior.Status == "scored") {
+                    return admission{Accepted: true, Kind: artifact.Manifest.Kind, TeamID: teamValue.ID, Intake: value}
+                  }
+                }
+                return reject("submission admission state is inconsistent")
+              }
               if attemptLimit > 0 && len(stateValue.Attempts) >= attemptLimit { return reject("team attempt quota exhausted") }
               for _, prior := range stateValue.Attempts {
                 if prior.HeadSHA == value.HeadSHA || prior.TarSHA256 == value.TarSHA256 { return reject("submission was replayed") }
@@ -377,14 +393,24 @@ jobs:
           func decode[T any](data []byte) T { var value T; if err := json.Unmarshal(data, &value); err != nil { panic(err) }; return value }
           func writeJSON(file string, value any) { if err := writeJSONFile(file, value); err != nil { panic(err) } }
           func writeJSONFile(file string, value any) error { data, err := json.MarshalIndent(value, "", "  "); if err != nil { return err }; if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil { return err }; return os.WriteFile(file, append(data, '\n'), 0o644) }
+          func onboardingClosures(value state, memberCount, current int) []int {
+            if len(value.KeyProofs) != memberCount { return nil }
+            pending := []int{value.Formation.PullRequest}
+            for _, proof := range value.KeyProofs { pending = append(pending, proof.PullRequest) }
+            slices.Sort(pending)
+            result := []int{}
+            for _, number := range uniqueInts(pending) { if number != current { result = append(result, number) } }
+            if slices.Contains(pending, current) { result = append(result, current) }
+            return result
+          }
           func uniqueInts(values []int) []int { result := []int{}; for _, value := range values { if !slices.Contains(result, value) { result = append(result, value) } }; return result }
           EOF
           (
             cd "$controller"
-            go mod download
+            go mod tidy
           )
 
-      - name: Admit and update trusted registry state
+      - name: Admit against trusted registry state
         id: result
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -393,8 +419,9 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/pulls/$(jq -r .pr_number "$RUNNER_TEMP/intake/intake.json")" > "$RUNNER_TEMP/current-pr.json"
           if jq -e \
             --arg head "$(jq -r .head_sha "$RUNNER_TEMP/intake/intake.json")" \
+            --arg base "$(jq -r .base_sha "$RUNNER_TEMP/intake/intake.json")" \
             --arg repository "$(jq -r .head_repository "$RUNNER_TEMP/intake/intake.json")" \
-            '.state == "open" and .base.ref == "main" and .head.sha == $head and .head.repo.full_name == $repository' \
+            '.state == "open" and .base.ref == "main" and .base.sha == $base and .head.sha == $head and .head.repo.full_name == $repository' \
             "$RUNNER_TEMP/current-pr.json" > /dev/null; then
             test "$(jq -r .blob_repository "$RUNNER_TEMP/intake/intake.json")" = "$GITHUB_REPOSITORY"
             gh api "repos/$GITHUB_REPOSITORY/git/blobs/$(jq -r .blob_sha "$RUNNER_TEMP/intake/intake.json")" > "$RUNNER_TEMP/request-blob.json"
@@ -406,10 +433,10 @@ jobs:
                 --registry "$GITHUB_WORKSPACE/registry" \
                 --intake "$RUNNER_TEMP/intake/intake.json" \
                 --request "$RUNNER_TEMP/intake/request.tar" \
-              --out "$RUNNER_TEMP/admission.json" \
-              --event-id "$EVENTCTL_EVENT_ID" \
-              --organizer-signing "$GITHUB_WORKSPACE/trusted-main/organizer.sig.pub" \
-              --organizer-encryption "$GITHUB_WORKSPACE/trusted-main/organizer.enc.pub" \
+                --out "$RUNNER_TEMP/admission.json" \
+                --event-id "$EVENTCTL_EVENT_ID" \
+                --organizer-signing "$GITHUB_WORKSPACE/trusted-main/organizer.sig.pub" \
+                --organizer-encryption "$GITHUB_WORKSPACE/trusted-main/organizer.enc.pub" \
                 --minimum-members "$EVENTCTL_MINIMUM_MEMBERS" \
                 --attempt-limit "$EVENTCTL_ATTEMPT_LIMIT"
             )
@@ -418,22 +445,6 @@ jobs:
               "$RUNNER_TEMP/intake/intake.json" > "$RUNNER_TEMP/admission.json"
           fi
           jq -r '"accepted=\(.accepted)\nkind=\(.kind)\nteam_id=\(.team_id)"' "$RUNNER_TEMP/admission.json" >> "$GITHUB_OUTPUT"
-          if test "$(jq -r .accepted "$RUNNER_TEMP/admission.json")" = true; then
-            git -C registry config user.name eventctl-controller
-            git -C registry config user.email eventctl-controller@users.noreply.github.com
-            git -C registry add teams
-            git -C registry commit -m "event: admit $(jq -r .kind "$RUNNER_TEMP/admission.json")"
-            git -C registry push origin HEAD:registry
-          fi
-
-      - name: Close activated onboarding pull requests
-        if: steps.result.outputs.accepted == 'true'
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          jq -r '.close_prs[]?' "$RUNNER_TEMP/admission.json" | while read -r number; do
-            gh api --method PATCH "repos/$GITHUB_REPOSITORY/pulls/$number" -f state=closed
-          done
 
       - name: Publish the pinned controller source for later trusted jobs
         id: publish-controller
@@ -442,6 +453,7 @@ jobs:
           source="$RUNNER_TEMP/eventctl-v3-controller-source"
           mkdir -p "$source"
           cp "$RUNNER_TEMP/eventctl-v3-controller/go.mod" "$source/go.mod"
+          cp "$RUNNER_TEMP/eventctl-v3-controller/go.sum" "$source/go.sum"
           cp "$RUNNER_TEMP/eventctl-v3-controller/main.go" "$source/main.go"
           cp trusted-main/organizer.sig.pub "$source/organizer.sig.pub"
           cp trusted-main/organizer.enc.pub "$source/organizer.enc.pub"
@@ -455,15 +467,17 @@ jobs:
           path: ${{ runner.temp }}/eventctl-v3-controller-source
           if-no-files-found: error
           retention-days: 1
+          overwrite: true
 
-      - name: Assemble the admitted-submission reference
+      - name: Assemble the immutable admitted-submission handoff
         if: steps.result.outputs.accepted == 'true' && steps.result.outputs.kind == 'submission'
         run: |
           handoff="$RUNNER_TEMP/eventctl-admission"
           mkdir -p "$handoff"
           cp "$RUNNER_TEMP/admission.json" "$handoff/admission.json"
+          cp "$RUNNER_TEMP/intake/request.tar" "$handoff/submission.tar"
 
-      - name: Publish the admitted-submission reference
+      - name: Publish the immutable admitted-submission handoff
         id: publish-submission
         if: steps.result.outputs.accepted == 'true' && steps.result.outputs.kind == 'submission'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -472,6 +486,48 @@ jobs:
           path: ${{ runner.temp }}/eventctl-admission
           if-no-files-found: error
           retention-days: 1
+          overwrite: true
+
+      - name: Reconfirm the PR head and publish trusted registry state
+        id: finalize
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          if test "$(jq -r .accepted "$RUNNER_TEMP/admission.json")" = true; then
+            publish=false
+            if test -n "$(git -C registry status --porcelain -- teams)"; then
+              git -C registry config user.name eventctl-controller
+              git -C registry config user.email eventctl-controller@users.noreply.github.com
+              git -C registry add teams
+              git -C registry commit -m "event: admit $(jq -r .kind "$RUNNER_TEMP/admission.json")"
+              publish=true
+            fi
+            gh api "repos/$GITHUB_REPOSITORY/pulls/$(jq -r .pr_number "$RUNNER_TEMP/intake/intake.json")" > "$RUNNER_TEMP/final-pr.json"
+            if ! jq -e \
+              --arg head "$(jq -r .head_sha "$RUNNER_TEMP/intake/intake.json")" \
+              --arg base "$(jq -r .base_sha "$RUNNER_TEMP/intake/intake.json")" \
+              --arg repository "$(jq -r .head_repository "$RUNNER_TEMP/intake/intake.json")" \
+              '.state == "open" and .base.ref == "main" and .base.sha == $base and .head.sha == $head and .head.repo.full_name == $repository' \
+              "$RUNNER_TEMP/final-pr.json" > /dev/null; then
+              jq '.accepted = false | .reason = "PR changed before its admission could be committed"' \
+                "$RUNNER_TEMP/admission.json" > "$RUNNER_TEMP/final-admission.json"
+              mv "$RUNNER_TEMP/final-admission.json" "$RUNNER_TEMP/admission.json"
+            elif test "$publish" = true; then
+              git -C registry push origin HEAD:registry
+            fi
+          fi
+          jq -r '"accepted=\(.accepted)\nkind=\(.kind)\nteam_id=\(.team_id)"' "$RUNNER_TEMP/admission.json" >> "$GITHUB_OUTPUT"
+
+      - name: Close activated onboarding pull requests
+        if: steps.finalize.outputs.accepted == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          jq -r '.close_prs[]?' "$RUNNER_TEMP/admission.json" | while read -r number; do
+            if test "$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number" --jq .state)" != closed; then
+              gh api --method PATCH "repos/$GITHUB_REPOSITORY/pulls/$number" -f state=closed
+            fi
+          done
 
   scorer:
     needs: admission
@@ -487,7 +543,7 @@ jobs:
         with:
           go-version: "1.26.5"
 
-      - name: Download the admitted-submission reference
+      - name: Download the immutable admitted-submission handoff
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v7.0.0
         with:
           name: eventctl-admission
@@ -499,19 +555,12 @@ jobs:
           name: eventctl-controller-source
           path: ${{ runner.temp }}/eventctl-v3-controller
 
-      - name: Materialize the exact public submission blob
+      - name: Materialize the exact admitted public submission
         run: |
-          source_repository="$(jq -r .intake.head_repository "$RUNNER_TEMP/admission/admission.json")"
-          source_head="$(jq -r .intake.head_sha "$RUNNER_TEMP/admission/admission.json")"
           expected_sha256="$(jq -r .intake.tar_sha256 "$RUNNER_TEMP/admission/admission.json")"
-          source_base="${EVENTCTL_PUBLIC_RAW_URL:-$GITHUB_SERVER_URL}"
-          [[ "$source_repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
-          [[ "$source_head" =~ ^[0-9a-f]{40}$ ]]
-          mkdir -p "$RUNNER_TEMP/admitted"
-          curl --fail --location --silent --show-error \
-            "$source_base/$source_repository/raw/$source_head/submission.tar" \
-            --output "$RUNNER_TEMP/admitted/submission.tar"
-          test "$(sha256sum "$RUNNER_TEMP/admitted/submission.tar" | awk '{print $1}')" = "$expected_sha256"
+          mkdir -p "$GITHUB_WORKSPACE/.eventctl/admitted"
+          cp "$RUNNER_TEMP/admission/submission.tar" "$GITHUB_WORKSPACE/.eventctl/admitted/submission.tar"
+          test "$(sha256sum "$GITHUB_WORKSPACE/.eventctl/admitted/submission.tar" | awk '{print $1}')" = "$expected_sha256"
 
       - name: Run the pinned event scorer without credentials
         id: score
@@ -525,7 +574,7 @@ jobs:
             --cap-drop ALL --security-opt no-new-privileges:true \
             --pids-limit 128 --memory 512m --cpus 1 --user 65532:65532 \
             --tmpfs /tmp:rw,noexec,nosuid,size=64m \
-            --mount "type=bind,src=$RUNNER_TEMP/admitted,dst=/input,readonly" \
+            --mount "type=bind,src=$GITHUB_WORKSPACE/.eventctl/admitted,dst=/input,readonly" \
             "$EVENTCTL_SCORER_IMAGE" sh -ceu "$EVENTCTL_SCORER_COMMAND" \
             > "$RUNNER_TEMP/scorer-output/log.txt" 2>&1
           code=$?
@@ -552,6 +601,7 @@ jobs:
           path: ${{ runner.temp }}/scorer-output/transport.age
           if-no-files-found: error
           retention-days: 1
+          overwrite: true
 
   result-update:
     needs: [admission, scorer]
@@ -566,7 +616,7 @@ jobs:
         with:
           go-version: "1.26.5"
 
-      - name: Download the admitted-submission reference
+      - name: Download the immutable admitted-submission handoff
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v7.0.0
         with:
           name: eventctl-admission
@@ -626,22 +676,33 @@ jobs:
               --feedback "$RUNNER_TEMP/feedback.tar"
           )
 
-      - name: Publish registry and leaderboard atomically
+      - name: Publish changed state branches
         run: |
-          if git -C registry diff --quiet && git -C leaderboard diff --quiet; then
-            exit 0
+          registry_changed=
+          leaderboard_changed=
+          if ! git -C registry diff --quiet; then
+            git -C registry config user.name eventctl-controller
+            git -C registry config user.email eventctl-controller@users.noreply.github.com
+            git -C registry add teams
+            git -C registry commit -m 'event: score submission'
+            registry_changed=1
           fi
-          git -C registry config user.name eventctl-controller
-          git -C registry config user.email eventctl-controller@users.noreply.github.com
-          git -C leaderboard config user.name eventctl-controller
-          git -C leaderboard config user.email eventctl-controller@users.noreply.github.com
-          git -C registry add teams
-          git -C registry commit -m 'event: score submission'
-          git -C leaderboard add leaderboard.json
-          git -C leaderboard commit -m 'event: update leaderboard'
-          git -C registry fetch "$GITHUB_WORKSPACE/leaderboard" HEAD:refs/heads/eventctl-leaderboard
-          board=$(git -C leaderboard rev-parse HEAD)
-          git -C registry push --atomic origin HEAD:registry "$board":leaderboard
+          if ! git -C leaderboard diff --quiet; then
+            git -C leaderboard config user.name eventctl-controller
+            git -C leaderboard config user.email eventctl-controller@users.noreply.github.com
+            git -C leaderboard add leaderboard.json
+            git -C leaderboard commit -m 'event: update leaderboard'
+            leaderboard_changed=1
+          fi
+          if test -n "$registry_changed" && test -n "$leaderboard_changed"; then
+            git -C registry fetch "$GITHUB_WORKSPACE/leaderboard" HEAD:refs/heads/eventctl-leaderboard
+            board=$(git -C leaderboard rev-parse HEAD)
+            git -C registry push --atomic origin HEAD:registry "$board":leaderboard
+          elif test -n "$registry_changed"; then
+            git -C registry push origin HEAD:registry
+          elif test -n "$leaderboard_changed"; then
+            git -C leaderboard push origin HEAD:leaderboard
+          fi
 
       - name: Upload encrypted feedback only
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -649,7 +710,20 @@ jobs:
           name: feedback
           path: ${{ runner.temp }}/feedback.tar
           if-no-files-found: error
+          overwrite: true
 
+  cleanup:
+    needs: [admission, scorer, result-update]
+    if: >-
+      always() &&
+      needs.admission.outputs.kind == 'submission' &&
+      (needs.admission.result != 'success' ||
+       needs.admission.outputs.accepted != 'true' ||
+       needs.result-update.result == 'success')
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    steps:
       - name: Delete short-lived internal pipeline artifacts
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -658,7 +732,9 @@ jobs:
             "${{ needs.admission.outputs.admission_artifact_id }}" \
             "${{ needs.admission.outputs.controller_source_artifact_id }}" \
             "${{ needs.scorer.outputs.transport_artifact_id }}"; do
-            if gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact" > /dev/null 2>&1; then
-              gh api --method DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact"
+            if test -n "$artifact" && ! output="$(gh api --method DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact" 2>&1)"; then
+              if [[ "$output" != *"HTTP 404"* ]]; then
+                echo "::warning::failed to delete internal artifact $artifact: $output"
+              fi
             fi
           done
