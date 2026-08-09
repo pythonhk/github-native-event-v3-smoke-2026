@@ -15,10 +15,10 @@ concurrency:
 
 env:
   # Set this to the new repository's owner/name before accepting requests.
-  EVENTCTL_EVENT_ID: pythonhk/REPLACE_ME
+  EVENTCTL_EVENT_ID: pythonhk/github-native-event-v3-smoke-2026
   EVENTCTL_MINIMUM_MEMBERS: "1"
-  EVENTCTL_ATTEMPT_LIMIT: "0"
-  EVENTCTL_SCORER_IMAGE: REPLACE_WITH_A_DIGEST_PINNED_IMAGE
+  EVENTCTL_ATTEMPT_LIMIT: "2"
+  EVENTCTL_SCORER_IMAGE: python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
   EVENTCTL_SCORER_COMMAND: test -f /input/submission.tar
 
 jobs:

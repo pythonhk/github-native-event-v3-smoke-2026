@@ -1,5 +1,8 @@
 # GitHub-native event starter v3
 
+This repository is the disposable hosted lifecycle smoke event for the v3
+starter. Its scorer accepts any valid `submission.tar`; it is not a challenge.
+
 This is a deliberately small template for a PythonHK event. Create a new
 repository with **all branches**, then configure the event directly in that new
 repository.
