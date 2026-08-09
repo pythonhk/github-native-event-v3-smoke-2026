@@ -4,7 +4,7 @@ on:
   workflow_run:
     workflows: [event / intake]
     types: [completed]
-    branches: [main]
+    # pull_request_target runs report the participant head branch here.
 
 permissions: {}
 
@@ -23,7 +23,7 @@ env:
 
 jobs:
   admission:
-    if: github.event.workflow_run.conclusion == 'success'
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request_target'
     runs-on: ubuntu-24.04
     permissions:
       actions: read
