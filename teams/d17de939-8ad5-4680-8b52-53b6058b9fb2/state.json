@@ -26,7 +26,7 @@
   "submission_prs": {
     "4": {
       "actor_id": "79151747",
-      "last_head_sha": "59f61cf692d9dd96e0ad885f86f9e634da5fd2b7"
+      "last_head_sha": "2e0d76270c75d5458253b56bd4249eae73b3eae7"
     }
   },
   "attempts": [
@@ -37,7 +37,18 @@
       "tar_sha256": "257fa9db785a4ed176cb2941fc2717942615caea2c5e39f688255725519d43d2",
       "status": "scored",
       "score": 1
+    },
+    {
+      "event_id": "pythonhk/github-native-event-v3-smoke-2026",
+      "team_id": "d17de939-8ad5-4680-8b52-53b6058b9fb2",
+      "attempt_id": "fa6e750e-e333-4cf4-a31e-35d81ffa8fc5",
+      "actor_id": "79151747",
+      "pull_request": 4,
+      "head_sha": "2e0d76270c75d5458253b56bd4249eae73b3eae7",
+      "tar_sha256": "6e748fae5a7a95767818147dc6281ef7f519782d2384259afd8c9deb2e41ecfd",
+      "status": "admitted",
+      "score": 0
     }
   ],
-  "scoring_status": "complete"
+  "scoring_status": "pending"
 }
