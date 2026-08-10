@@ -46,9 +46,9 @@
       "pull_request": 4,
       "head_sha": "2e0d76270c75d5458253b56bd4249eae73b3eae7",
       "tar_sha256": "6e748fae5a7a95767818147dc6281ef7f519782d2384259afd8c9deb2e41ecfd",
-      "status": "admitted",
-      "score": 0
+      "status": "scored",
+      "score": 1
     }
   ],
-  "scoring_status": "pending"
+  "scoring_status": "complete"
 }
