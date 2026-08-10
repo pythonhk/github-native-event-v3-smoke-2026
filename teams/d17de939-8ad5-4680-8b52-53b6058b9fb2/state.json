@@ -1,5 +1,5 @@
 {
-  "status": "pending",
+  "status": "active",
   "formation": {
     "actor_id": "79151747",
     "pull_request": 2,
@@ -8,6 +8,13 @@
     "tar_sha256": "f319a7f1d099a63d201763c0ce38f096d2d08266e5c579a142d601e25ae817b7"
   },
   "key_proofs": {
+    "148024134": {
+      "actor_id": "148024134",
+      "pull_request": 3,
+      "head_sha": "fdea84ac62e707d282d5b3368a412338a7543715",
+      "blob_sha": "1cee4a3122ad39178c0b308f4d4e6a932db02ea1",
+      "tar_sha256": "7b29fab5c87098945015b3f3098f2d530301ac7af0358b19a427d940a7e48ed6"
+    },
     "79151747": {
       "actor_id": "79151747",
       "pull_request": 2,
