@@ -1,0 +1,22 @@
+{
+  "status": "pending",
+  "formation": {
+    "actor_id": "79151747",
+    "pull_request": 2,
+    "head_sha": "2c3159a1f7eeb59de8f0314e04d18db42a74b214",
+    "blob_sha": "2cc8172b6064aaae5eb8bbfc9e185c78160fda23",
+    "tar_sha256": "f319a7f1d099a63d201763c0ce38f096d2d08266e5c579a142d601e25ae817b7"
+  },
+  "key_proofs": {
+    "79151747": {
+      "actor_id": "79151747",
+      "pull_request": 2,
+      "head_sha": "2c3159a1f7eeb59de8f0314e04d18db42a74b214",
+      "blob_sha": "2cc8172b6064aaae5eb8bbfc9e185c78160fda23",
+      "tar_sha256": "f319a7f1d099a63d201763c0ce38f096d2d08266e5c579a142d601e25ae817b7"
+    }
+  },
+  "submission_prs": {},
+  "attempts": [],
+  "scoring_status": "idle"
+}
