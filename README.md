@@ -81,8 +81,13 @@ copies the already verified public `submission.tar` into an immutable handoff
 artifact. The scorer consumes that handoff and mounts the tar read-only. It
 emits an encrypted transport artifact for the trusted update job; raw logs are
 never uploaded. The update job signs and encrypts the final `feedback.tar` to
-every registered team encryption public key, then removes all internal pipeline
-artifacts.
+every registered team encryption public key. Its `feedback.json` binds the
+event, team, attempt, actor, PR, head commit, and submission digest to the score
+and feedback. The update job rejects a transport whose binding differs from the
+admission. After a successful controller run, its three short-lived handoff and
+transport artifacts are removed. The separate intake run retains a one-day
+public-provenance `intake.json` receipt containing no request tar, logs, or
+secrets; failure-path internal artifacts also expire after one day.
 
 Repository access stays in the trusted admission job. Do not give the scorer a
 repository token; the immutable handoff is its only input channel.

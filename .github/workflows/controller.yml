@@ -40,6 +40,7 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v6.0.0
         with:
           go-version: "1.26.5"
+          cache: false
 
       - name: Download trusted intake artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v7.0.0
@@ -128,13 +129,20 @@ jobs:
             LastHeadSHA string `json:"last_head_sha"`
           }
 
+          type requestBinding struct {
+            EventID     string `json:"event_id,omitempty"`
+            TeamID      string `json:"team_id,omitempty"`
+            AttemptID   string `json:"attempt_id,omitempty"`
+            ActorID     string `json:"actor_id,omitempty"`
+            PullRequest int    `json:"pull_request,omitempty"`
+            HeadSHA     string `json:"head_sha,omitempty"`
+            TarSHA256   string `json:"tar_sha256,omitempty"`
+          }
+
           type attempt struct {
-            ActorID   string `json:"actor_id"`
-            PR        int    `json:"pull_request"`
-            HeadSHA   string `json:"head_sha"`
-            TarSHA256 string `json:"tar_sha256"`
-            Status    string `json:"status"`
-            Score     int    `json:"score"`
+            requestBinding
+            Status string `json:"status"`
+            Score  int    `json:"score"`
           }
 
           type state struct {
@@ -147,15 +155,16 @@ jobs:
           }
 
           type admission struct {
+            requestBinding
             Accepted bool   `json:"accepted"`
             Reason   string `json:"reason,omitempty"`
             Kind     string `json:"kind,omitempty"`
-            TeamID   string `json:"team_id,omitempty"`
             Intake   intake `json:"intake"`
             ClosePRs []int  `json:"close_prs,omitempty"`
           }
 
           type transport struct {
+            requestBinding
             Score    int    `json:"score"`
             Feedback string `json:"feedback"`
           }
@@ -216,6 +225,7 @@ jobs:
             expected := map[string]string{"team-formation": "formation.tar", "team-key": "key.tar", "submission": "submission.tar"}
             if expected[artifact.Manifest.Kind] != value.Name { return reject("artifact kind does not match changed filename") }
             source := provenance{ActorID: value.ActorID, PullRequest: value.PullRequest, HeadSHA: value.HeadSHA, BlobSHA: value.BlobSHA, TarSHA256: value.TarSHA256}
+            binding := requestBinding{EventID: artifact.Manifest.EventID, TeamID: artifact.Manifest.TeamID, AttemptID: artifact.Manifest.AttemptID, ActorID: value.ActorID, PullRequest: value.PullRequest, HeadSHA: value.HeadSHA, TarSHA256: value.TarSHA256}
             directory := filepath.Join(registry, "teams", artifact.Manifest.TeamID)
 
             switch artifact.Manifest.Kind {
@@ -226,7 +236,7 @@ jobs:
                 if err != nil { return reject("team ID already exists") }
                 proof, exists := stateValue.KeyProofs[value.ActorID]
                 if teamValue.ID != artifact.Manifest.TeamID || teamValue.Name != artifact.Manifest.TeamName || !slices.Equal(teamValue.Members, artifact.Manifest.Members) || stateValue.Formation != source || !exists || proof != source { return reject("team ID already exists") }
-                return admission{Accepted: true, Kind: artifact.Manifest.Kind, TeamID: teamValue.ID, Intake: value, ClosePRs: onboardingClosures(stateValue, len(teamValue.Members), value.PullRequest)}
+                return admission{requestBinding: binding, Accepted: true, Kind: artifact.Manifest.Kind, Intake: value, ClosePRs: onboardingClosures(stateValue, len(teamValue.Members), value.PullRequest)}
               } else if !errors.Is(err, os.ErrNotExist) { return reject(err.Error()) }
               teamValue := team{ID: artifact.Manifest.TeamID, Name: artifact.Manifest.TeamName, Members: artifact.Manifest.Members}
               status := "pending"
@@ -234,7 +244,7 @@ jobs:
               if len(teamValue.Members) == 1 { status, close = "active", []int{value.PullRequest} }
               stateValue := state{Status: status, Formation: source, KeyProofs: map[string]provenance{value.ActorID: source}, SubmissionPRs: map[string]lane{}, Attempts: []attempt{}, ScoringStatus: "idle"}
               if err := writeTeam(directory, teamValue, stateValue, value.ActorID, artifact.Manifest.SigningPublicKey, artifact.Manifest.EncryptionPublicKey); err != nil { return reject(err.Error()) }
-              return admission{Accepted: true, Kind: artifact.Manifest.Kind, TeamID: teamValue.ID, Intake: value, ClosePRs: close}
+              return admission{requestBinding: binding, Accepted: true, Kind: artifact.Manifest.Kind, Intake: value, ClosePRs: close}
             case "team-key":
               teamValue, stateValue, err := readTeam(directory)
               if err != nil { return reject("unknown team") }
@@ -242,7 +252,7 @@ jobs:
               if !slices.Contains(teamValue.Members, value.ActorID) || value.ActorID == stateValue.Formation.ActorID { return reject("key proof actor is invalid") }
               if proof, exists := stateValue.KeyProofs[value.ActorID]; exists {
                 if proof != source { return reject("member key already accepted") }
-                return admission{Accepted: true, Kind: artifact.Manifest.Kind, TeamID: teamValue.ID, Intake: value, ClosePRs: onboardingClosures(stateValue, len(teamValue.Members), value.PullRequest)}
+                return admission{requestBinding: binding, Accepted: true, Kind: artifact.Manifest.Kind, Intake: value, ClosePRs: onboardingClosures(stateValue, len(teamValue.Members), value.PullRequest)}
               }
               if stateValue.Status != "pending" { return reject("key proof is not for a pending formation") }
               stateValue.KeyProofs[value.ActorID] = source
@@ -253,7 +263,7 @@ jobs:
                 close = onboardingClosures(stateValue, len(teamValue.Members), value.PullRequest)
               }
               if err := writeJSONFile(filepath.Join(directory, "state.json"), stateValue); err != nil { return reject(err.Error()) }
-              return admission{Accepted: true, Kind: artifact.Manifest.Kind, TeamID: teamValue.ID, Intake: value, ClosePRs: close}
+              return admission{requestBinding: binding, Accepted: true, Kind: artifact.Manifest.Kind, Intake: value, ClosePRs: close}
             case "submission":
               teamValue, stateValue, err := readTeam(directory)
               if err != nil { return reject("unknown team") }
@@ -267,21 +277,21 @@ jobs:
               if exists && existing.ActorID != value.ActorID { return reject("submission PR belongs to a different actor") }
               if exists && existing.LastHeadSHA == value.HeadSHA {
                 for _, prior := range stateValue.Attempts {
-                  if prior.ActorID == value.ActorID && prior.PR == value.PullRequest && prior.HeadSHA == value.HeadSHA && prior.TarSHA256 == value.TarSHA256 && (prior.Status == "admitted" || prior.Status == "scored") {
-                    return admission{Accepted: true, Kind: artifact.Manifest.Kind, TeamID: teamValue.ID, Intake: value}
+                  if prior.requestBinding == binding && (prior.Status == "admitted" || prior.Status == "scored") {
+                    return admission{requestBinding: binding, Accepted: true, Kind: artifact.Manifest.Kind, Intake: value}
                   }
                 }
                 return reject("submission admission state is inconsistent")
               }
               if attemptLimit > 0 && len(stateValue.Attempts) >= attemptLimit { return reject("team attempt quota exhausted") }
               for _, prior := range stateValue.Attempts {
-                if prior.HeadSHA == value.HeadSHA || prior.TarSHA256 == value.TarSHA256 { return reject("submission was replayed") }
+                if prior.AttemptID == artifact.Manifest.AttemptID || prior.HeadSHA == value.HeadSHA || prior.TarSHA256 == value.TarSHA256 { return reject("submission was replayed") }
               }
               stateValue.SubmissionPRs[key] = lane{ActorID: value.ActorID, LastHeadSHA: value.HeadSHA}
-              stateValue.Attempts = append(stateValue.Attempts, attempt{ActorID: value.ActorID, PR: value.PullRequest, HeadSHA: value.HeadSHA, TarSHA256: value.TarSHA256, Status: "admitted"})
+              stateValue.Attempts = append(stateValue.Attempts, attempt{requestBinding: binding, Status: "admitted"})
               stateValue.ScoringStatus = "pending"
               if err := writeJSONFile(filepath.Join(directory, "state.json"), stateValue); err != nil { return reject(err.Error()) }
-              return admission{Accepted: true, Kind: artifact.Manifest.Kind, TeamID: teamValue.ID, Intake: value}
+              return admission{requestBinding: binding, Accepted: true, Kind: artifact.Manifest.Kind, Intake: value}
             default:
               return reject("unsupported artifact kind")
             }
@@ -331,13 +341,14 @@ jobs:
             payload, err := io.ReadAll(reader)
             if err != nil { panic(err) }
             scored := decode[transport](payload)
+            if scored.requestBinding != accepted.requestBinding { panic("scorer transport does not match the admitted submission") }
             directory := filepath.Join(*registry, "teams", accepted.TeamID)
             teamValue, stateValue, err := readTeam(directory)
             if err != nil { panic(err) }
             matched := false
             for index := range stateValue.Attempts {
               current := &stateValue.Attempts[index]
-              if current.PR != accepted.Intake.PullRequest || current.HeadSHA != accepted.Intake.HeadSHA { continue }
+              if current.requestBinding != accepted.requestBinding { continue }
               switch current.Status {
               case "admitted":
                 current.Status, current.Score, matched = "scored", scored.Score, true
@@ -362,7 +373,7 @@ jobs:
             if err != nil { panic(err) }
             if !bytes.Equal(signing.Public().(ed25519.PublicKey), expectedSigning) { panic("organizer signing private key does not match its public key") }
             log := filepath.Join(filepath.Dir(*feedback), "feedback.json")
-            if err := writeJSONFile(log, map[string]any{"team_id": teamValue.ID, "score": scored.Score, "feedback": scored.Feedback}); err != nil { panic(err) }
+            if err := writeJSONFile(log, map[string]any{"event_id": scored.EventID, "team_id": scored.TeamID, "attempt_id": scored.AttemptID, "actor_id": scored.ActorID, "pull_request": scored.PullRequest, "head_sha": scored.HeadSHA, "tar_sha256": scored.TarSHA256, "score": scored.Score, "feedback": scored.Feedback}); err != nil { panic(err) }
             recipients := make([]age.Recipient, 0, len(teamValue.Members))
             for _, member := range teamValue.Members {
               public, err := protocol.LoadEncryptionPublic(filepath.Join(directory, member+".enc.pub"))
@@ -542,6 +553,7 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v6.0.0
         with:
           go-version: "1.26.5"
+          cache: false
 
       - name: Download the immutable admitted-submission handoff
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v7.0.0
@@ -579,8 +591,10 @@ jobs:
             > "$RUNNER_TEMP/scorer-output/log.txt" 2>&1
           code=$?
           set -e
-          jq -n --argjson score "$code" --rawfile feedback "$RUNNER_TEMP/scorer-output/log.txt" \
-            '{score: (if $score == 0 then 1 else 0 end), feedback: $feedback}' > "$RUNNER_TEMP/scorer-output/result.json"
+          jq -n --slurpfile admission "$RUNNER_TEMP/admission/admission.json" \
+            --argjson score "$code" --rawfile feedback "$RUNNER_TEMP/scorer-output/log.txt" \
+            '$admission[0] | {event_id, team_id, attempt_id, actor_id, pull_request, head_sha, tar_sha256, score: (if $score == 0 then 1 else 0 end), feedback: $feedback}' \
+            > "$RUNNER_TEMP/scorer-output/result.json"
 
       - name: Encrypt scorer transport to the organizer
         run: |
@@ -615,6 +629,7 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v6.0.0
         with:
           go-version: "1.26.5"
+          cache: false
 
       - name: Download the immutable admitted-submission handoff
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v7.0.0
