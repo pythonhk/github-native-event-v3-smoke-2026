@@ -23,7 +23,21 @@
       "tar_sha256": "f319a7f1d099a63d201763c0ce38f096d2d08266e5c579a142d601e25ae817b7"
     }
   },
-  "submission_prs": {},
-  "attempts": [],
-  "scoring_status": "idle"
+  "submission_prs": {
+    "4": {
+      "actor_id": "79151747",
+      "last_head_sha": "59f61cf692d9dd96e0ad885f86f9e634da5fd2b7"
+    }
+  },
+  "attempts": [
+    {
+      "actor_id": "79151747",
+      "pull_request": 4,
+      "head_sha": "59f61cf692d9dd96e0ad885f86f9e634da5fd2b7",
+      "tar_sha256": "257fa9db785a4ed176cb2941fc2717942615caea2c5e39f688255725519d43d2",
+      "status": "admitted",
+      "score": 0
+    }
+  ],
+  "scoring_status": "pending"
 }
